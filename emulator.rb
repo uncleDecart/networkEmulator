@@ -1,9 +1,7 @@
 require 'Qt4'
 require 'time'
-require_relative "packetParser"
-
-# При connection request передаем радиус. По сути он не нужен
-# Но единство пакетов 
+require 'optparse'
+require_relative "packet_parser"
 
 # Сделать только функцию шифровки и так проверять
 # Возможно дешифровка менее затратна по ресурсам 
@@ -22,8 +20,25 @@ require_relative "packetParser"
 #		отожрёт эт
 #
 #
-#		ФАКАП С ФЛАГОМ waitForRecivingPacket
+#		СДЕЛАТЬ ОДНУ СТРУКТУРУ, В КОТОРОЙ БУДЕТ ХРАНИТСЯ ВСЁ(?)
+#
+#		Маршруты
+#			Полудуплексное соединение
+#			Дуплексное соединение
+#			Естественный отбор пакетов
+#				id для пакетов
+#				принимаю только первый успешно прешедший
+#		Периоды активности устройства
 
+# Надо сделать легкозаменяемую "слоёную" структуру, чтобы
+# если что можно было легко заменить любой компонент
+
+$options = {}
+
+OptionParser.new do |opt|
+  opt.on("-d", "--debug") { |o| $options[:debug] = o }
+	opt.on("-sd", "--sending-delay") { |o| $options[:sending_delay] = o}
+end.parse!
 
 class Node < Qt::Object
 
@@ -31,196 +46,228 @@ class Node < Qt::Object
 									  
 	DEFAULT_MAC = "0000:0000:0000:0000"
 	WIDE_MAC = "0000:0000:0000:0000" 
-	DEFAULT_RADUIS = 0
 	
 	signals 'send(const QString&)'
 	slots 'recive(const QString&)'
 
-	attr_reader :attributes, :recived_message
+	attr_reader :attributes, :recived_message, :connected_devices
 
+	# Объединить эти структуры в одну?
 	@@Attributes = Struct.new(:mac_address, :time)
-	@@Route = Struct.new(:id, :mac_address)
-
+	@@Route = Struct.new(:id, :from, :to) 
+	@@Neighbour = Struct.new(:mac_address, :packet_count, :forwarding_confirmed) do
+		def empty?
+			(mac_address == WIDE_MAC)? true : false
+		end
+	end
+		
 	@@Nodes = []
 
-	@@PacketsAmount = 0
-
-
-	def initialize(mac = DEFAULT_MAC, parent = nil)
+	def initialize(mac = DEFAULT_MAC, key = 0, parent = nil)
 		super parent
+	
+		@to_whom_mac = nil 
+		@recived_message = nil 
+		@from_whom_mac = nil 
 
 		@attributes = @@Attributes.new mac, Time.new 
+		@key = key
 
-		@timing_table = Array.new
-		@connected_devices = Array.new
-		@routes = Array.new
-		@sendedPackets = Array.new
+		@timing_table = []
+		@connected_devices = [] 
+		@routes = []
 
-		@availableConnection = true
+		@available_connection = true
 		@requestConnection = false
-		@waitForRecivingPacket = true
 		@waitForConfirmingConnection = false
 		
 		@@Nodes << self unless mac == nil
 	end
 	
-	def self.elements
-		@@Nodes
-	end
 	
-	def connectTo node
+	def connect_to(node)
 		@requestConnection = true
 		@timing_table << @@Attributes.new(node.attributes.mac_address, Time.now)	
-		sendMessage node.attributes.mac_address, @@connection_request_exp.to_s
+		
+		send_message(node.attributes.mac_address, @@connection_request_exp.source)
 	end
-	def sendMessageTo node, message
-		if deviceConnected node.attributes.mac_address
+	def send_message_to(node, message)
+		packet_key = form_packet_key(node)
+		cur_route = find_route(packet_key)	
+		if device_connected(node.attributes.mac_address)
 			mac = node.attributes.mac_address
+		elsif !cur_route.nil?
+			mac = (cur_route.from.mac_address == @attributes.mac_address)?
+			 	cur_route.to.mac_address : cur_route.from.mac_address 
 		else
 			mac = WIDE_MAC
 		end
-		packetKey = dynamicLengthVariable formPacketKey(node)
-		sendMessage mac, (@@sending_exp.to_s + packetKey + message)
+	
+		@packet_count = (cur_route.nil?)? 0 : cur_route.from.packet_count
+		update_routes(packet_key, @attributes.mac_address, @packet_count + 1, true)
+		tmp = dyn_len_var(packet_key.to_s + dyn_len_var(@packet_count))
+		send_message(mac, (@@sending_exp.source + tmp + message))
 	end
 	# Всегда формируем ключ пакета по ноде, которой передаём  
-	def formPacketKey nodeTo
-		return nodeTo.attributes.mac_address.tr(':', '').to_i
+	def form_packet_key(nodeTo)
+		@key
 	end
 
-	def decodeKey key
-		res = key.to_s
-	   	(16 - res.length).times do
-			res.prepend('0')
-		end
-		3.times do |i|
-			res.insert(4 + 5 * i, ':')
-		end
-		return res
-	end
-
-	def recive packet
-		#puts "recived : #{packet}"
-		
-		#Плохо реализован parsePacket
-		#возможно реализовать пакет, в котором
-		#фиксировано кол-во битов для разных полей
-		#но как быть с переменными динамической длины
-		parsePacket packet
-		if (@recived_mac == @attributes.mac_address) or (@recived_mac == DEFAULT_MAC)
+	def recive(packet)
+		parse_packet(packet)
+		if @to_whom_mac == @attributes.mac_address || @to_whom_mac == WIDE_MAC 
 			case @recived_message
 				when @@connection_request_exp
-					@timing_table << @@Attributes.new(@from_mac, Time.now)
+					@timing_table << @@Attributes.new(@from_whom_mac, Time.now)
 					@waitForConfirmingConnection = true
-					sendMessage @from_mac, @@connection_available_exp.to_s if @availableConnection
+					
+					if @available_connection
+						send_message(@from_whom_mac, @@connection_available_exp.source)
+					end
 				when @@connection_available_exp
-					connection_duration = calculateConnectionDuration @from_mac 
-					if !deviceConnected @from_mac and (@requestConnection) and !connection_duration.nil?
-						@connected_devices << @@Attributes.new(@from_mac, connection_duration) 
-						sendMessage @from_mac, @@connection_confirmed_exp.to_s
+					connection_duration = calculate_connection_duration(@from_whom_mac) 
+					if !device_connected @from_whom_mac && (@requestConnection) && 
+						 !connection_duration.nil?
+						@connected_devices << @@Attributes.new(@from_whom_mac, 
+																									 connection_duration) 
+						send_message(@from_whom_mac, @@connection_confirmed_exp.source)
 						@requestConnection = false
 					end
 				when @@connection_confirmed_exp
-					connection_duration = calculateConnectionDuration @from_mac 
-					if !deviceConnected @from_mac and @waitForConfirmingConnection and !connection_duration.nil?
-						@connected_devices << @@Attributes.new(@from_mac, connection_duration) 
+					connection_duration = calculate_connection_duration(@from_whom_mac) 
+					if !device_connected @from_whom_mac && @waitForConfirmingConnection &&
+					 	 !connection_duration.nil?
+						@connected_devices << @@Attributes.new(@from_whom_mac, 
+																									 connection_duration) 
 						@waitForConfirmingConnection = false 
 					end
 				when @@sending_exp
-					@recived_message.slice! @@sending_exp.to_s
-					# Второй уровень обработки 
-					@message_key = cutDynamicLengthVariable @recived_message
-					if @waitForRecivingPacket
-						if  (@message_key.to_i) == (formPacketKey(self).to_i)
-							updateRoutes
-							puts "THATS FOR ME! #{decodeKey @message_key} == #{self.attributes.mac_address}"
-							puts @recived_message
-						else
-							@waitForRecivingPacket = false
-							forwardMessage
-						end
-					else
-						@waitForRecivingPacket = true	
+					# Второй уровень обработки
+					@message_key = cut_dyn_len_var(@recived_message)
+					@packet_count = cut_dyn_len_var(@message_key).to_i
+					cur_route = find_route(@message_key.to_i)
+					forwarding_mac = find_direction(cur_route).mac_address
+					
+					if cur_route.nil? || cur_route.from.forwarding_confirmed == false
+						update_routes(@message_key.to_i, @from_whom_mac, @packet_count, false)
 					end
-				else 
-					#puts "ILLEGAL"
+					
+					cur_route = find_route(@message_key.to_i)
+					direction = find_direction(cur_route)
+					
+					@recived_message.slice!(@@sending_exp.source)
+					if  @message_key.to_i == @key && !cur_route.from.forwarding_confirmed
+						if $options[:debug]
+							puts "#{@attributes.mac_address} THATS FOR ME!"
+							puts @recived_message
+						end
+							cur_route.from.forwarding_confirmed = false
+							forward_message(forwarding_mac, true)
+					else
+						unless cur_route.from.forwarding_confirmed
+							#cur_route - указатель на элемент @routes
+							cur_route.from.forwarding_confirmed = true
+							forward_message(forwarding_mac)
+						else
+							cur_route.from.forwarding_confirmed = false 
+						end
+					end
 			end
+		elsif @@sending_exp.match(@recived_message)
+			@message_key = cut_dyn_len_var(@recived_message)
+			@packet_count = cut_dyn_len_var(@message_key).to_i
+			cur_route = find_route(@message_key.to_i)
+			if	!cur_route.nil? && cur_route.from.forwarding_confirmed
+				cur_route.from.forwarding_confirmed = false   
+			end																		  
 		end
 	end	
-
-	def printMessage
-		puts "recived message : #{@recived_message}" 
+	def self.elements
+		@@Nodes
 	end
-
-	def printConnectedDevices
+	def print_connected_devices
 		@connected_devices.each {|d| puts d.to_s}
 	end
-	def printRoutes
-		@routes.each {|r| puts r.to_s}
+	def print_routes
+		@routes.each do |r| 
+			puts "from :#{r.from}"
+			puts "to   :#{r.to}"
+		end
 	end
 	
 	protected 
 
-	def sendMessage toWhom, message
-		packet = formPacket toWhom, message
-		puts "#{Time.now.strftime "%H:%M:%S"} @ sending : #{packet}"
-	   	#sleep(1)	
-		emit send packet 
+	def send_message(to_whom, message)
+		packet = form_packet(to_whom, message, @attributes.mac_address)
+		puts "#{Time.now.strftime "%H:%M:%S"}@sending:#{packet}" if $options[:debug]
+	  sleep($options[:sending_delay].to_i)	
+		emit send(packet) 
 	end
-
-	def calculateConnectionDuration mac
+	
+	def calculate_connection_duration(mac)
 		return nil if @timing_table.empty?
 		res = nil
 		@timing_table.delete_if do |element|
   			if element.mac_address = mac
-				res = (Time.now.to_i - element.time.to_i)  
+				res = Time.now.to_i - element.time.to_i  
     			true 
   				#break пробегает по всей таблице!!1 плохо, с брейком не удаляет!!1
 			end
 		end
-		return res
+		res
 	end	
-	
-	def forwardMessage
-		#routeMac = findRoute @message_key.to_i
-		#updateRoutes
-		routeMac = WIDE_MAC
-		sendMessage routeMac, (@@sending_exp.to_s + dynamicLengthVariable(@message_key) + @recived_message)
-	end
-	def findRoute id
-		@routes.each do |route|
-			return route.mac_address if route.id == id
+
+	def find_direction(route)
+		unless route.nil?
+			(route.from.mac_address == @from_whom_mac || 
+			 route.from.mac_address == @attributes.mac_address)? 
+				route.to : route.from
+		else
+			@@Neighbour.new(WIDE_MAC, nil, nil)
 		end
-		return WIDE_MAC
 	end
-	def updateRoutes
+
+	def forward_message(mac, ending = false)
+		tmp = dyn_len_var(@message_key.to_s + dyn_len_var(@packet_count))
+		mes = @@sending_exp.source + tmp + @recived_message
+		send_message(mac, mes)
+	end
+	def find_route(id)
+		@routes.each do |route|
+			return route if route.id == id
+		end
+		nil
+	end
+	def update_routes(key, mac, packet_count = 0, forwarding_confirmed = true)
 		containsRoute = false
 		@routes.each do |route|
-			if route.id == @message_key.to_i
-				route.mac_address = @from_mac
+			if route.id == key
+				return unless route.from.empty? || route.to.empty?
+				if route.from.empty?
+					route.from = @@Neighbour.new
+					neighbour = route.from
+				else
+					route.to = @@Neighbour.new
+					neighbour = route.to
+				end
+				neighbour.mac_address = mac if neighbour.mac_address.nil?
+				unless forwarding_confirmed.nil?
+					neighbour.forwarding_confirmed = forwarding_confirmed
+				end
+				neighbour.packet_count = packet_count
 				containsRoute = true
 				break
 			end
 		end
-		@routes << @@Route.new(@message_key.to_i, @from_mac) unless containsRoute
+		from = @@Neighbour.new(mac, packet_count, forwarding_confirmed)
+		@routes << @@Route.new(key, from, @@Neighbour.new(WIDE_MAC, nil, nil)) unless containsRoute
 	end
 
-	def deviceConnected mac
+	def device_connected(mac)
 		@connected_devices.each do |device|
 			return true if device.mac_address == mac	
 		end	
-		return false	
-	end
-
-	def packetSendConfirmation
-		res = false
-		@sendedPackets.delete_if do |element|
-			if element == @from_mac
-				res = true  
-				true 
-				#break пробегает по всей таблице!!1 плохо, с брейком не удаляет!!1
-			end
-		end
-		return res
+		false	
 	end
 
 end
@@ -229,19 +276,20 @@ class Observer < Node
 
 	attr_reader :table
 
-	@@ObserverAttr = Struct.new(:mac_address, :amount_of_messages, :total_message_len)
+	@@ObserverAttr = Struct.new(:mac_address, :amount_of_messages,
+														 	:total_message_len)
 	
 	def initialize
 		super nil, nil
 		@table = []
 	end
 
-	def recive packet
+	def recive(packet)
 		len = packet.length 
-		parsePacket packet
-		match = find @from_mac
-		if match == nil then
-			@table << @@ObserverAttr.new(@from_mac, 1, len)
+		parse_packet(packet)
+		match = find(@from_whom_mac)
+		if match.nil? then
+			@table << @@ObserverAttr.new(@from_whom_mac, 1, len)
 		else
 			match.amount_of_messages += 1
 			match.total_message_len += len
@@ -250,61 +298,66 @@ class Observer < Node
 
 	private
 
-	def find mac
+	def find(mac)
 		unless @table.empty?
 			@table.each do |element|
 				return element if element.mac_address == mac
 			end
 		end
-		return nil
+		nil
 	end
 
 end
 
 
-def connect_nodes nodeA, nodeB
-	Qt::Object.connect(nodeA, SIGNAL('send(const QString&)'),nodeB, SLOT('recive(const QString&)'))
-	Qt::Object.connect(nodeB, SIGNAL('send(const QString&)'),nodeA, SLOT('recive(const QString&)'))
+def connect_nodes(nodeA, nodeB)
+	Qt::Object.connect(nodeA, SIGNAL('send(const QString&)'),nodeB, 
+										 SLOT('recive(const QString&)'))
+	Qt::Object.connect(nodeB, SIGNAL('send(const QString&)'),nodeA, 
+										 SLOT('recive(const QString&)'))
 end
 
-def printStat
+def print_stat
 	Node.elements.each do |node|
 		puts "=" * 25
 		puts "Mac :  #{node.attributes.mac_address}"
 		puts "Devices : "
-		node.printConnectedDevices
+		node.print_connected_devices
 		puts "Routes : "
-		node.printRoutes
-		puts "=" * 25
+		node.print_routes
 	end
 end
 
 observer = Observer.new
 
-nodeA = Node.new "0000:0000:0000:0001" 
-nodeB = Node.new "0000:0000:0000:0002"
-nodeC = Node.new "0000:0000:0000:0003"
-nodeD = Node.new "0000:0000:0000:0004"
+nodeA = Node.new("0000:0000:0000:0001", 1) 
+nodeB = Node.new("0000:0000:0000:0002", 0)
+nodeC = Node.new("0000:0000:0000:0003", 0)
+nodeD = Node.new("0000:0000:0000:0004", 1)
 
 Node.elements.each do |node|
-	connect_nodes node, observer 
+	connect_nodes(node, observer) 
 end
 
-connect_nodes nodeA, nodeB
-connect_nodes nodeB, nodeC
-connect_nodes nodeC, nodeD
+connect_nodes(nodeA, nodeB)
+connect_nodes(nodeB, nodeC)
+connect_nodes(nodeC, nodeD)
 
-nodeA.connectTo nodeB
-nodeB.connectTo nodeC
-nodeC.connectTo nodeD
+nodeA.connect_to(nodeB)
+nodeB.connect_to(nodeC)
+nodeC.connect_to(nodeD)
 
-nodeA.sendMessageTo nodeC, "YANKIES"
-nodeC.sendMessageTo nodeA, "BAZINGA"
+nodeA.send_message_to(nodeD, "YANKIES")
+nodeD.send_message_to(nodeA, "BAZINGA")
+nodeA.send_message_to(nodeD, "HORNETS")
 
-#printStat
+if $options[:debug]
 
-puts "Observer stat"
-observer.table.each do |element|
-	puts element
+	print_stat
+
+	#puts "Observer stat"
+	#observer.table.each do |element|
+	#	puts element
+	#end
+
 end
-

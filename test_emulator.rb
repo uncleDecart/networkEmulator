@@ -2,8 +2,6 @@ require_relative "emulator"
 require "test/unit"
 
 class TestPacketParser < Test::Unit::TestCase
-	
-	include Node
 
 	def test_connect_to
 		nodeA = Node.new("0000:0000:0000:0001")
@@ -19,5 +17,5 @@ class TestPacketParser < Test::Unit::TestCase
 								 nodeA.attributes.mac_address)
 
 	end
-	
+
 end
