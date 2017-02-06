@@ -83,15 +83,35 @@ class TestPacketParser < Test::Unit::TestCase
 		
 		from_whom = "0000:0000:0000:0000"
 		var = "zozo"
-		message = "MESSAGE#{dyn_len_var(var)}"
+		text = "MESSAGE"
+		message = "#{text}#{dyn_len_var(var)}"
 		to_whom = "0000:0000:0000:0001"
 		packet = form_packet(to_whom, message, from_whom)
 		parse_packet(packet)
+		res_var = cut_dyn_len_var(@recived_message)
 		assert_equal(to_whom, @to_whom_mac)
-		assert_equal(message, @recived_message)
+		assert_equal(text, @recived_message)
+		assert_equal(var, res_var)
 		assert_equal(from_whom, @from_whom_mac)
 		assert_equal("", packet)
+		
+		from_whom = "0000:0000:0000:0000"
+		var = "zozo"
+		second_var = "zuzu"
+		tmp = dyn_len_var(var + dyn_len_var(second_var))
+		text = "MESSAGE"
+		message = "#{text}#{tmp}"
+		to_whom = "0000:0000:0000:0001"
+		packet = form_packet(to_whom, message, from_whom)
+		parse_packet(packet)	
+		res_var = cut_dyn_len_var(@recived_message)
+		res_second_var = cut_dyn_len_var(res_var)
+		assert_equal(to_whom, @to_whom_mac)
+		assert_equal(from_whom, @from_whom_mac)
+		assert_equal(var, res_var)
+		assert_equal(second_var, res_second_var)
+		assert_equal(text, @recived_message)
+		assert_equal("", packet)
 	end
-
 end
 

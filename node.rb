@@ -46,7 +46,7 @@ class Node < Qt::Object
 	DEFAULT_MAC = "0000:0000:0000:0000"
 	WIDE_MAC = "0000:0000:0000:0000" 
 	
-	signals 'send(const QString&)'
+	signals 'send(const QString&)', 'push_text(const QString&)'
 	slots 'recive(const QString&)'
 
 	attr_reader :attributes, :recived_message, :connected_devices, :routes
@@ -83,7 +83,6 @@ class Node < Qt::Object
 		@@Nodes << self unless mac == nil
 	end
 	
-	
 	def connect_to(node)
 		@requestConnection = true
 		@timing_table << @@Attributes.new(node.attributes.mac_address, Time.now)	
@@ -102,18 +101,19 @@ class Node < Qt::Object
 			mac = WIDE_MAC
 		end
 		unless cur_route.nil?
-			#puts "CUR_ROUTE"
-			#puts "from :#{cur_route.from}"
-			#puts "to   :#{cur_route.to}"
-			direction = (cur_route.from.mac_address == @attributes.mac_address)? cur_route.from : cur_route.to	
-			#puts "direction #{direction}" unless direction.nil?
+			direction = (cur_route.from.mac_address == @attributes.mac_address)?
+			 						 cur_route.from : cur_route.to	
 		end
-		@packet_count = (cur_route.nil?)? 0 : direction.packet_count
+		if cur_route.nil?
+			@packet_count = 0
+		else
+			direction.packet_count += 1 unless direction.mac_address == WIDE_MAC
+			@packet_count = direction.packet_count
+		end
 		update_routes(packet_key, @attributes.mac_address, @packet_count, true)
 		tmp = dyn_len_var(packet_key.to_s + dyn_len_var(@packet_count))
 		send_message(mac, (@@sending_exp.source + tmp + message))
 	end
-	# Всегда формируем ключ пакета по ноде, которой передаём  
 	def form_packet_key(nodeTo)
 		@key
 	end
@@ -147,62 +147,48 @@ class Node < Qt::Object
 						@waitForConfirmingConnection = false 
 					end
 				when @@sending_exp
-					# Второй уровень обработки
 					@message_key = cut_dyn_len_var(@recived_message)
-					@packet_count = cut_dyn_len_var(@message_key).to_i
+					packet_count = cut_dyn_len_var(@message_key).to_i
 					cur_route = find_route(@message_key.to_i)
 					forwarding_mac = find_direction(cur_route).mac_address
 					
-					if cur_route.nil? || cur_route.from.forwarding_confirmed == false
-						update_routes(@message_key.to_i, @from_whom_mac, @packet_count, false)
+					unless cur_route.nil?
+						direction = (cur_route.from.mac_address == @attributes.mac_address)?
+											 cur_route.from : cur_route.to	
 					end
 					
+					if (cur_route.nil? || direction.forwarding_confirmed == false) 
+						update_routes(@message_key.to_i, @from_whom_mac, packet_count,false)
+					end
+				
 					cur_route = find_route(@message_key.to_i)
-					#direction = find_direction(cur_route)
 					direction = (cur_route.from.mac_address == @attributes.mac_address)? 
 											 cur_route.from : cur_route.to	
-					#puts "#{@attributes.mac_address}"
-					#puts "have directions"
-					#puts "from :#{cur_route.from}"
-					#puts "to   :#{cur_route.to}"
-					#puts "find"
-					#puts direction
-					direction.packet_count += 1 if direction.forwarding_confirmed
-					
+		
 					@recived_message.slice!(@@sending_exp.source)
-					if  @message_key.to_i == @key && !cur_route.from.forwarding_confirmed
-						if $options[:debug]
-							#puts "#{@attributes.mac_address} THATS FOR ME!"
-							#puts @recived_message
-						end
-						cur_route.from.forwarding_confirmed = false
-						forward_message(@from_whom_mac)
+			
+					if  @message_key.to_i == @key && !direction.forwarding_confirmed
+						print "#{@attributes.mac_address} THATS FOR ME!"
+						print @recived_message
+						forward_message(@from_whom_mac, packet_count)
 					else
-						unless cur_route.from.forwarding_confirmed
-							#cur_route - указатель на элемент @routes
-							cur_route.from.forwarding_confirmed = true
-							forward_message(forwarding_mac)
+						unless direction.forwarding_confirmed
+							direction.forwarding_confirmed = true
+							forward_message(forwarding_mac, packet_count)
 						else
-							cur_route.from.forwarding_confirmed = false 
+							direction.forwarding_confirmed = false 
 						end
 					end
 			end
 		elsif @@sending_exp.match(@recived_message)
 			@message_key = cut_dyn_len_var(@recived_message)
-			@packet_count = cut_dyn_len_var(@message_key).to_i
+			packet_count = cut_dyn_len_var(@message_key).to_i
 			cur_route = find_route(@message_key.to_i)
 			unless cur_route.nil?
 				direction = (cur_route.from.mac_address == @attributes.mac_address)? 
 										 cur_route.from : cur_route.to	
 				if !direction.nil? && direction.forwarding_confirmed
-					direction.packet_count += 1 if direction.forwarding_confirmed
 					direction.forwarding_confirmed = false   
-					#puts "#{@attributes.mac_address}"
-					#puts "have directions (packet not for me)"
-					#puts "from :#{cur_route.from}"
-					#puts "to   :#{cur_route.to}"
-					#puts "find"
-					#puts direction
 				end
 			end																		  
 		end
@@ -211,20 +197,32 @@ class Node < Qt::Object
 		@@Nodes
 	end
 	def print_connected_devices
-		@connected_devices.each {|d| puts d.to_s}
+		@connected_devices.each {|d| print d.to_s}
 	end
 	def print_routes
 		@routes.each do |r| 
-			puts "from :#{r.from}"
-			puts "to   :#{r.to}"
+			print "from :#{r.from}"
+			print "to   :#{r.to}"
 		end
 	end
 	
+	def to_s
+		res = "Mac :  #{@attributes.mac_address}\n" + 
+					"Devices :\n"
+		@connected_devices.each {|d| res += d.to_s + "\n"}
+		res += "Routes : \n"	
+		
+		@routes.each do |r| 
+			res += "from :#{r.from}\n" + "to   :#{r.to}\n"
+		end
+		res
+	end
+
 	protected 
 
 	def send_message(to_whom, message)
 		packet = form_packet(to_whom, message, @attributes.mac_address)
-		puts "#{Time.now.strftime "%H:%M:%S"}@sending:#{packet}" if $options[:debug]
+		print "#{Time.now.strftime "%H:%M:%S"}@sending:#{packet}"
 	  sleep($options[:sending_delay].to_i)	
 		emit send(packet) 
 	end
@@ -256,8 +254,8 @@ class Node < Qt::Object
 		end
 	end
 
-	def forward_message(mac)
-		tmp = dyn_len_var(@message_key.to_s + dyn_len_var(@packet_count))
+	def forward_message(mac, packet_count)
+		tmp = dyn_len_var(@message_key.to_s + dyn_len_var(packet_count))
 		mes = @@sending_exp.source + tmp + @recived_message
 		send_message(mac, mes)
 	end
@@ -271,7 +269,6 @@ class Node < Qt::Object
 		containsRoute = false
 		@routes.each do |route|
 			if route.id == key
-				#return unless route.from.empty? || route.to.empty?
 				if route.from.empty?
 					route.from = @@Neighbour.new
 					neighbour = route.from
@@ -301,41 +298,26 @@ class Node < Qt::Object
 		false	
 	end
 
-end
-
-class Observer < Node
-
-	attr_reader :table
-
-	@@ObserverAttr = Struct.new(:mac_address, :amount_of_messages,
-														 	:total_message_len)
-	
-	def initialize
-		super nil, nil
-		@table = []
-	end
-
-	def recive(packet)
-		len = packet.length 
-		parse_packet(packet)
-		match = find(@from_whom_mac)
-		if match.nil? then
-			@table << @@ObserverAttr.new(@from_whom_mac, 1, len)
-		else
-			match.amount_of_messages += 1
-			match.total_message_len += len
-		end
-	end
-
-	private
-
-	def find(mac)
-		unless @table.empty?
-			@table.each do |element|
-				return element if element.mac_address == mac
-			end
-		end
-		nil
+	def print(mes)
+		puts mes.to_s if $options[:debug]
+		emit push_text(mes.to_s)
 	end
 
 end
+
+def connect_nodes(nodeA, nodeB)
+	Qt::Object.connect(nodeA, SIGNAL('send(const QString&)'),nodeB, 
+										 SLOT('recive(const QString&)'))
+	Qt::Object.connect(nodeB, SIGNAL('send(const QString&)'),nodeA, 
+										 SLOT('recive(const QString&)'))
+end
+
+def print_stat
+	Node.elements.each do |node|
+		print("=" * 25 + "\n")
+		print node.to_s
+	end
+
+end
+
+
