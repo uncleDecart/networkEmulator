@@ -2,6 +2,7 @@ require 'Qt4'
 require 'time'
 require 'optparse'
 require_relative "packet_parser"
+require_relative "sending_enviroment"
 
 # Сделать только функцию шифровки и так проверять
 # Возможно дешифровка менее затратна по ресурсам 
@@ -42,11 +43,12 @@ end.parse!
 class Node < Qt::Object
 
 	include PacketParser
+	include Sending
 									  
 	DEFAULT_MAC = "0000:0000:0000:0000"
 	WIDE_MAC = "0000:0000:0000:0000" 
 	
-	signals 'send(const QString&)', 'push_text(const QString&)'
+	signals 'state_changed(const QString&, const QString&)', 'push_text(const QString&)'
 	slots 'recive(const QString&)'
 
 	attr_reader :attributes, :recived_message, :connected_devices, :routes
@@ -80,14 +82,18 @@ class Node < Qt::Object
 		@requestConnection = false
 		@waitForConfirmingConnection = false
 		
-		@@Nodes << self unless mac == nil
+
+		@@Nodes << self unless mac == nil 
 	end
 	
 	def connect_to(node)
-		@requestConnection = true
-		@timing_table << @@Attributes.new(node.attributes.mac_address, Time.now)	
-		
-		send_message(node.attributes.mac_address, @@connection_request_exp.source)
+        unless connected?(node.attributes.mac_address)
+			@requestConnection = true
+			@timing_table << @@Attributes.new(node.attributes.mac_address, Time.now)	
+			
+			send_message(node.attributes.mac_address, 
+												 @@connection_request_exp.source)
+		end
 	end
 	def send_message_to(node, message)
 		packet_key = form_packet_key(node)
@@ -105,7 +111,7 @@ class Node < Qt::Object
 			 						 cur_route.from : cur_route.to	
 		end
 		if cur_route.nil?
-			@packet_count = 0
+			@packet_count = 1
 		else
 			direction.packet_count += 1 unless direction.mac_address == WIDE_MAC
 			@packet_count = direction.packet_count
@@ -119,22 +125,26 @@ class Node < Qt::Object
 	end
 
 	def recive(packet)
-		parse_packet(packet)
+        emit state_changed(self.attributes.mac_address.to_s, "reciving")
+        #sleep(0.5) # for graph mode
+        parse_packet(packet)
 		if @to_whom_mac == @attributes.mac_address || @to_whom_mac == WIDE_MAC 
 			case @recived_message
 				when @@connection_request_exp
-					@timing_table << @@Attributes.new(@from_whom_mac, Time.now)
-					@waitForConfirmingConnection = true
-					
-					if @available_connection
-						send_message(@from_whom_mac, @@connection_available_exp.source)
-					end
+                    unless connected?(@from_whom_mac)
+                        @timing_table << @@Attributes.new(@from_whom_mac, Time.now)
+                        @waitForConfirmingConnection = true
+                        
+                        if @available_connection
+                            send_message(@from_whom_mac, @@connection_available_exp.source)
+                        end
+                    end
 				when @@connection_available_exp
 					connection_duration = calculate_connection_duration(@from_whom_mac) 
 					if !device_connected @from_whom_mac && (@requestConnection) && 
 						 !connection_duration.nil?
 						@connected_devices << @@Attributes.new(@from_whom_mac, 
-																									 connection_duration) 
+															   connection_duration) 
 						send_message(@from_whom_mac, @@connection_confirmed_exp.source)
 						@requestConnection = false
 					end
@@ -143,7 +153,7 @@ class Node < Qt::Object
 					if !device_connected @from_whom_mac && @waitForConfirmingConnection &&
 					 	 !connection_duration.nil?
 						@connected_devices << @@Attributes.new(@from_whom_mac, 
-																									 connection_duration) 
+																connection_duration) 
 						@waitForConfirmingConnection = false 
 					end
 				when @@sending_exp
@@ -154,7 +164,13 @@ class Node < Qt::Object
 					
 					unless cur_route.nil?
 						direction = (cur_route.from.mac_address == @attributes.mac_address)?
-											 cur_route.from : cur_route.to	
+											 cur_route.from : cur_route.to
+						
+						if direction.packet_count == packet_count && 
+							 !direction.forwarding_confirmed && 
+							 direction.mac_address != WIDE_MAC #send deny? 
+							return
+						end
 					end
 					
 					if (cur_route.nil? || direction.forwarding_confirmed == false) 
@@ -164,10 +180,13 @@ class Node < Qt::Object
 					cur_route = find_route(@message_key.to_i)
 					direction = (cur_route.from.mac_address == @attributes.mac_address)? 
 											 cur_route.from : cur_route.to	
-		
+				
 					@recived_message.slice!(@@sending_exp.source)
-			
-					if  @message_key.to_i == @key && !direction.forwarding_confirmed
+                    puts "AMIGO #{packet_count} cmp to #{direction.packet_count}"
+					if	@message_key.to_i == @key && !direction.forwarding_confirmed &&
+                        packet_count > direction.packet_count
+                        
+                        direction.forwarding_confirmed = true
 						print "#{@attributes.mac_address} THATS FOR ME!"
 						print @recived_message
 						forward_message(@from_whom_mac, packet_count)
@@ -192,6 +211,7 @@ class Node < Qt::Object
 				end
 			end																		  
 		end
+        emit state_changed(self.attributes.mac_address.to_s, "online")
 	end	
 	def self.elements
 		@@Nodes
@@ -218,13 +238,14 @@ class Node < Qt::Object
 		res
 	end
 
-	protected 
+protected 
 
 	def send_message(to_whom, message)
 		packet = form_packet(to_whom, message, @attributes.mac_address)
 		print "#{Time.now.strftime "%H:%M:%S"}@sending:#{packet}"
-	  sleep($options[:sending_delay].to_i)	
-		emit send(packet) 
+        emit state_changed(self.attributes.mac_address.to_s, "sending")
+		send_to_env(packet)
+        emit state_changed(self.attributes.mac_address.to_s, "online")
 	end
 	
 	def calculate_connection_duration(mac)
@@ -264,6 +285,13 @@ class Node < Qt::Object
 			return route if route.id == id
 		end
 		nil
+	end
+	def connected?(addr)
+		return false if @connected_devices.empty?
+		@connected_devices.each do |d|
+			return true if d.mac_address == addr 
+		end
+		return false
 	end
 	def update_routes(key, mac, packet_count = 0, forwarding_confirmed = true)
 		containsRoute = false
@@ -306,11 +334,16 @@ class Node < Qt::Object
 end
 
 def connect_nodes(nodeA, nodeB)
+	SendingEnviroment.instance.connect_nodes(nodeA, nodeB)
+	#connect_nodes_signals(nodeA,nodeB) 
+end
+def connect_nodes_signals(nodeA, nodeB)
 	Qt::Object.connect(nodeA, SIGNAL('send(const QString&)'),nodeB, 
 										 SLOT('recive(const QString&)'))
 	Qt::Object.connect(nodeB, SIGNAL('send(const QString&)'),nodeA, 
 										 SLOT('recive(const QString&)'))
 end
+
 
 def print_stat
 	Node.elements.each do |node|
@@ -319,5 +352,4 @@ def print_stat
 	end
 
 end
-
 

@@ -11,11 +11,10 @@ class QtApp < Qt::Widget
 	def initialize
 		super
 		
-		setup_emulator
+		setup_emulator()
 		initUI
 
-		resize 500, 250
-		#move 300, 300
+		resize 1920, 1080
 		show
 	end
 
@@ -70,7 +69,6 @@ class QtApp < Qt::Widget
 		vbox.addLayout group
 
 		vbox1.addWidget @log_text_box
-		#vbox1.addStretch 1
 		vbox1.addWidget @quit_button, 0, Qt::AlignRight
 
 		hbox.addLayout vbox
@@ -82,14 +80,26 @@ class QtApp < Qt::Widget
 		setLayout vbox2
 
 		Qt::Object.connect(@widget, SIGNAL('node_changed(const QString &)'),
-											 @node_text_box, SLOT('setText(const QString &)'))
+											 @node_text_box, SLOT('setText(const QString &)'), 
+											 Qt::DirectConnection)
+
+		Node.elements.each do |node|
+			Qt::Object.connect(node, SIGNAL('push_text(const QString&)'), 
+											self, SLOT('update_log(const QString&)'), 
+											Qt::DirectConnection)
+		end
+
 	end
 	
 	def start_emulation
-		run_emulation
+		t = Thread.new { run_emulation() }
 	end
 	def update_log(mes)
 		@log_text_box.append(mes)
+		#update()
+	end
+	def update_topology_widget
+		@widget.drawWidget(Qt::Painter.new(self))
 	end
 
 end
@@ -99,14 +109,9 @@ app = Qt::Application.new ARGV
 qt = QtApp.new
 
 
-Node.elements.each do |node|
-	Qt::Object.connect(node, SIGNAL('push_text(const QString&)'), 
-										 qt, SLOT('update_log(const QString&)') )
-end
 
 Qt::Object.connect(qt.start_button, SIGNAL('clicked()'),
 									 qt, SLOT('start_emulation()'))
 Qt::Object.connect(qt.quit_button, SIGNAL('clicked()'), app, SLOT('quit()'))
 
 app.exec
-
